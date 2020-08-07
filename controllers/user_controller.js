@@ -4,7 +4,6 @@ const qrcode = require("qrcode");
 const cloudinary = require('cloudinary');
 const SendOtp = require("sendotp");
 const axios = require("axios");
-const uuidv1 = require('uuid/v1');
 const imgUpload = require('../config/imgUpload');
 const User = require("../models/User");
 const Contact = require("../models/Contacts");
@@ -59,11 +58,13 @@ forgetPasswordEmail = async (req, res) => {
   let email = req;
   let user = await User.findOne({ email });
   if (user) {
-    let token = Date.now() + user._id + Math.random(10000000000);
+    let password = generatePassword();
+    const salt = await bcrypt.genSalt(10);
+    let token = await bcrypt.hash(password, salt);
     user.resetPwd.token = token;
     user.resetPwd.expiresIn = Date.now() + 3600000;
     await user.save();
-    await email2(user._id, user.name, email, token);
+    await email2(user._id, user.name, email, password);
   } else {
     return res.status(400).json({ success: false, message: "User not found!" });
   }
@@ -89,12 +90,25 @@ generatePassword = (req, res) => {
   return retVal;
 }
 
+generateRandomString = (req, res) => {
+  var length = 8,
+    charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+    retVal = "";
+  for (var i = 0, n = charset.length; i < length; ++i) {
+    retVal += charset.charAt(Math.floor(Math.random() * n));
+  }
+  return retVal;
+}
+
 module.exports.register = async (req, res) => {
   let { firstName, lastName, email, contact, password, confirmPassword, referral_code, role } = req.body;
   if (!role)
     role = "customer";
   var name;
-  if (lastName === "") name = firstName;
+  contact = "+91" + contact;
+  let x = generateRandomString();
+  let bonus = 0;
+  if (lastName === undefined) name = firstName;
   else name = firstName + " " + lastName;
   if (!name || !email || !contact || !password || !role)
     return res.status(400).json({
@@ -121,6 +135,8 @@ module.exports.register = async (req, res) => {
           let newUser;
           if (referral_code && role == "customer") {
             temp_user = await User.findOne({ referral_code });
+            if (!temp_user)
+              return res.status(400).json({ status: false, message: "Referral Code is not valid!" });
             temp_user.bonus = 100;
             temp_user.save();
             newUser = {
@@ -131,6 +147,7 @@ module.exports.register = async (req, res) => {
               bonus: 50,
               contact
             };
+            bonus = 50;
           }
           else {
             newUser = {
@@ -176,11 +193,18 @@ module.exports.register = async (req, res) => {
                 "Verification Email & OTP cannot be sent. Login to recieve!"
             });
           } else {
-            res.status(200).json({
-              success: true,
-              message:
-                "Registeration Successful! Verify Your Email Address & Mobile Number!"
-            });
+            if (bonus == 0)
+              res.status(200).json({
+                success: true,
+                message:
+                  "Registeration Successful! Verify Your Email Address & Mobile Number!"
+              });
+            else
+              res.status(200).json({
+                success: true,
+                message:
+                  "Registeration Successful! Hurray! You have recieved 50 bonus points.. Verify Your Email Address & Mobile Number to claim the reward!"
+              });
           }
         }
       } else {
@@ -197,7 +221,6 @@ module.exports.register = async (req, res) => {
 };
 
 module.exports.addStaff = async (req, res) => {
-
   let { firstName, lastName, email, contact } = req.body;
   let role = "staff";
   let password = generatePassword();
@@ -218,9 +241,6 @@ module.exports.addStaff = async (req, res) => {
             .status(400)
             .json({ message: "Email or Contact already registered with us!" });
         } else {
-          const token = req.header("x-auth-token");
-          const decodedPayload = jwt.verify(token, process.env.SECRET);
-          req.user = decodedPayload;
           let newUser;
           newUser = {
             name,
@@ -289,17 +309,42 @@ module.exports.addStaff = async (req, res) => {
 
 module.exports.login = async (req, res) => {
   let { email, mobile, password } = req.body;
+  mobile = "+91" + mobile;
   var user;
   user = await User.findOne({ $or: [{ email: email }, { contact: mobile }] });
-  debugger
   if (!user) {
-    return res.status(400).json({ success: false, message: "User not found!" });
+    return res.status(400).json({ success: false, reset: false, message: "User not found!" });
   }
   let isMatch = await bcrypt.compare(password, user.password);
   if (!isMatch) {
-    return res
-      .status(401)
-      .json({ success: false, message: "Wrong Credentials!" });
+    if (!user.resetPwd.token)
+      return res.status(401).json({ success: false, reset: false, message: "Wrong Credentials!" });
+    else {
+      if (user.resetPwd.expiresIn < Date.now()) {
+        forgetPasswordEmail(user.email);
+        return res.status(400).json({
+          success: false,
+          reset: false,
+          message: "Time Expired! New Email is sent!"
+        });
+      } else {
+        let isMatch1 = await bcrypt.compare(password, user.resetPwd.token);
+        if (isMatch1) {
+          return res.status(200).json({
+            success: false,
+            reset: true,
+            message: "Now you can reset your password!"
+          });
+        }
+        else {
+          return res.status(400).json({
+            success: false,
+            reset: false,
+            message: "Enter the password sent to your mail correctly!"
+          });
+        }
+      }
+    }
   } else if (
     isMatch &&
     user.isEmailVerified === false &&
@@ -311,18 +356,21 @@ module.exports.login = async (req, res) => {
     ) {
       return res.status(401).json({
         success: false,
+        reset: false,
         message: "Verify your EmailID & your Mobile Number!"
       });
     } else if (user.verifyEmail.expiresIn < Date.now()) {
       await sendVerificationLink(user.email);
       return res.status(401).json({
         success: false,
+        reset: false,
         message: "Verify your EmailID Now!"
       });
     } else if (user.otpExpiresIn < Date.now()) {
       await sendOtpToMobile(user);
       return res.status(401).json({
         success: false,
+        reset: false,
         message: "Verify your Mobile No. Now!"
       });
     } else {
@@ -330,6 +378,7 @@ module.exports.login = async (req, res) => {
       await sendOtpToMobile(user);
       return res.status(401).json({
         success: false,
+        reset: false,
         message: "Verify your EmailID & your Mobile Number now!"
       });
     }
@@ -337,23 +386,23 @@ module.exports.login = async (req, res) => {
     if (user.otpExpiresIn >= Date.now()) {
       return res
         .status(401)
-        .json({ success: false, message: "Verify your Mobile No.!" });
+        .json({ success: false, reset: false, message: "Verify your Mobile No.!" });
     } else {
       await sendOtpToMobile(user);
       return res
         .status(401)
-        .json({ success: false, message: "Verify your Mobile No. now!" });
+        .json({ success: false, reset: false, message: "Verify your Mobile No. now!" });
     }
   } else if (isMatch && user.isEmailVerified === false) {
     if (user.verifyEmail.expiresIn >= Date.now()) {
       return res
         .status(401)
-        .json({ success: false, message: "Verify your EmailID!" });
+        .json({ success: false, reset: false, message: "Verify your EmailID!" });
     } else {
       await sendVerificationLink(user.email);
       return res
         .status(401)
-        .json({ success: false, message: "Verify your EmailID now!" });
+        .json({ success: false, reset: false, message: "Verify your EmailID now!" });
     }
   } else {
     if (user.resetPwd.token) {
@@ -411,18 +460,39 @@ module.exports.login = async (req, res) => {
       },
       process.env.SECRET,
       {
-        expiresIn: 604800 // for 1 week time in milliseconds
+        expiresIn: 604800 // for 1 week time in seconds
       }
     );
+    let user2 = {
+      _id: undefined,
+      name: undefined,
+      email: undefined,
+      role: undefined,
+      contact: undefined,
+      qrcode: {
+        id: undefined,
+        url: undefined
+      },
+      referral_code: undefined,
+      bonus: undefined
+    };
+    user2._id = user._id;
+    user2.name = user.name;
+    user2.email = user.email;
+    user2.role = user.role;
+    user2.contact = user.contact;
+    user2.qrcode.id = user.qrcode.id;
+    user2.qrcode.qrcode_url = user.qrcode.url;
+    user2.referral_code = user.referral_code;
+    user2.bonus = user.bonus;
     return res
       .header("x-auth-token", token)
       .status(200)
-      .json({ success: true, message: "Logged In!", token: token });
+      .json({ success: true, reset: false, message: "Logged In!", token: token, user: user2 });
   }
 };
 
 module.exports.verifyEmail = async (req, res) => {
-
   let { email, token } = req.params;
   let user = await User.findOne({ email: email });
   if (user) {
@@ -476,7 +546,7 @@ module.exports.verifyEmail = async (req, res) => {
         },
         process.env.SECRET,
         {
-          expiresIn: 604800 // for 1 week time in milliseconds
+          expiresIn: 604800 // for 1 week time in seconds
         }
       );
       res
@@ -505,7 +575,7 @@ module.exports.verifyEmail = async (req, res) => {
       user.isContactVerified === true
     ) {
       if (user.role == "customer")
-        user.referral_code = uuidv1();
+        user.referral_code = generateRandomString();
       user.isEmailVerified = true;
       user.verifyEmail.token = undefined;
       user.verifyEmail.expiresIn = undefined;
@@ -559,7 +629,7 @@ module.exports.verifyEmail = async (req, res) => {
         },
         process.env.SECRET,
         {
-          expiresIn: 604800 // for 1 week time in milliseconds
+          expiresIn: 604800 // for 1 week time in seconds
         }
       );
       res
@@ -601,8 +671,8 @@ module.exports.verifyEmail = async (req, res) => {
 };
 
 module.exports.verifyContact = async (req, res) => {
-
   let { contact } = req.params;
+  contact = "+91" + contact;
   let { otp } = req.body;
   let user = await User.findOne({ contact: contact });
   if (user) {
@@ -656,7 +726,7 @@ module.exports.verifyContact = async (req, res) => {
         },
         process.env.SECRET,
         {
-          expiresIn: 604800 // for 1 week time in milliseconds
+          expiresIn: 604800 // for 1 week time in seconds
         }
       );
       res
@@ -688,7 +758,7 @@ module.exports.verifyContact = async (req, res) => {
             user.isEmailVerified === true
           ) {
             if (user.role == "customer")
-              user.referral_code = uuidv1();
+              user.referral_code = generateRandomString();
             user.isContactVerified = true;
             user.otpExpiresIn = undefined;
             await user.save();
@@ -741,7 +811,7 @@ module.exports.verifyContact = async (req, res) => {
               },
               process.env.SECRET,
               {
-                expiresIn: 604800 // for 1 week time in milliseconds
+                expiresIn: 604800 // for 1 week time in seconds
               }
             );
             res
@@ -786,8 +856,8 @@ module.exports.verifyContact = async (req, res) => {
 };
 
 module.exports.retryContactVerification = async (req, res) => {
-
   let { contact } = req.params;
+  contact = "+91" + contact;
   let user = await User.findOne({ contact: contact });
   if (user) {
     if (user.isContactVerified === true && user.isEmailVerified === true) {
@@ -840,7 +910,7 @@ module.exports.retryContactVerification = async (req, res) => {
         },
         process.env.SECRET,
         {
-          expiresIn: 604800 // for 1 week time in milliseconds
+          expiresIn: 604800 // for 1 week time in seconds
         }
       );
       res
@@ -907,7 +977,6 @@ module.exports.retryContactVerification = async (req, res) => {
 };
 
 module.exports.profile = async (req, res) => {
-
   let user = await User.findById(req.user.data._id);
   id = user._id;
   isEmailVerified = user.isEmailVerified;
@@ -917,6 +986,8 @@ module.exports.profile = async (req, res) => {
   contact = user.contact;
   role = user.role;
   qr = user.qrcode.url;
+  referral_code = user.referral_code;
+  bonus = user.bonus;
   return res.status(200).json({
     _id: id,
     isEmailVerified: isEmailVerified,
@@ -925,31 +996,97 @@ module.exports.profile = async (req, res) => {
     email: email,
     contact: contact,
     role: role,
-    qrcode: qr
+    qrcode: qr,
+    referral_code: referral_code,
+    bonus: bonus
   });
-};
+}
+
+module.exports.update = async (req, res) => {
+  let { name, email, contact } = req.body;
+  let user = await User.findById(req.user.data._id);
+  if (user) {
+    let flag = false, flag1 = false;
+    if (name === user.name && user.email === email && user.contact === contact)
+      return res.status(400).json({ message: "Entries can't be same!" });
+    if (!(user.email === email)) {
+      await sendVerificationLink(email);
+      user.isEmailVerified = false;
+      user.email = email;
+      flag1 = true;
+    }
+    if (!(user.contact === contact)) {
+      user.contact = contact;
+      user.isContactVerified = false;
+      await user.save();
+      await sendOtpToMobile(user);
+      flag = true;
+    }
+    if (!(user.name === name)) {
+      user.name = name;
+    }
+    await user.save();
+    let user1 = {
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      contact: user.contact
+    };
+    let JSONobject = JSON.stringify(user1);
+    var opts = {
+      errorCorrectionLevel: 'H',
+      type: 'image/jpeg',
+      quality: 1,
+      margin: 1
+    }
+    qrcode.toDataURL(JSONobject, opts)
+      .then(url => {
+        cloudinary.uploader.upload(url, (result, error) => {
+          if (result) {
+            user.qrcode.id = result.public_id;
+            user.qrcode.url = result.url;
+            user.save();
+          } else if (error) {
+            console.log("QR Code is not Uploaded!");
+          }
+        });
+      })
+      .catch(err => {
+        console.error(err)
+      })
+    if (flag || flag1)
+      return res.status(200).json({ contact: flag, message: "Profile updated! Need to verify in order to login successfully next time!" });
+    return res.status(200).json({ message: "Profile updated!" });
+  }
+  else {
+    return res.status(400).json({ message: "No such User!" });
+  }
+}
 
 module.exports.sendForgetEmail = async (req, res) => {
-
   let { emailormobile } = req.params;
+  let phoneRegex = /^([0|\+[0-9]{1,5})?([6-9][0-9]{9})$/;
+  if (phoneRegex.test(emailormobile))
+    emailormobile = "+91" + emailormobile;
   let user = await User.findOne({ $or: [{ email: emailormobile }, { contact: emailormobile }] });
   if (user) {
     if (user.isContactVerified === true && user.isEmailVerified === true) {
       if (!user.resetPwd.token || user.resetPwd.expiresIn < Date.now()) {
         forgetPasswordEmail(user.email);
-        res.status(200).json({ message: "Forget Password Email Sent!" });
-      } else res.status(400).json({ message: "Already Availed!" });
+        return res.status(200).json({ message: "Forget Password Email Sent!" });
+      } else return res.status(400).json({ message: "Already Availed!" });
     } else if (
       user.isContactVerified === true &&
       user.isEmailVerified === false
     ) {
       if (user.verifyEmail.expiresIn >= Date.now())
-        res.status(200).json({
+        return res.status(200).json({
           message: "Verify your email Id first."
         });
       else {
         await sendVerificationLink(user.email);
-        res.status(200).json({
+        return res.status(200).json({
           message: "Verify your email Id first now."
         });
       }
@@ -958,12 +1095,12 @@ module.exports.sendForgetEmail = async (req, res) => {
       user.isContactVerified === false
     ) {
       if (user.otpExpiresIn >= Date.now())
-        res.status(200).json({
+        return res.status(200).json({
           message: "Verify your Mobile No. first."
         });
       else {
         await sendOtpToMobile(user);
-        res.status(200).json({
+        return res.status(200).json({
           message: "Verify your Mobile No. first now."
         });
       }
@@ -972,7 +1109,7 @@ module.exports.sendForgetEmail = async (req, res) => {
         user.verifyEmail.expiresIn >= Date.now() &&
         user.otpExpiresIn >= Date.now()
       )
-        res.status(200).json({
+        return res.status(200).json({
           message: "Verify your email Id first & Mobile No."
         });
       else if (
@@ -980,7 +1117,7 @@ module.exports.sendForgetEmail = async (req, res) => {
         user.otpExpiresIn >= Date.now()
       ) {
         await sendVerificationLink(user.email);
-        res.status(200).json({
+        return res.status(200).json({
           message: "Verify your email Id first now & Mobile No."
         });
       } else if (
@@ -988,103 +1125,95 @@ module.exports.sendForgetEmail = async (req, res) => {
         user.otpExpiresIn < Date.now()
       ) {
         await sendOtpToMobile(user);
-        res.status(200).json({
+        return res.status(200).json({
           message: "Verify your email Id first & Mobile No. now"
         });
       } else {
         await sendVerificationLink(user.email);
         await sendOtpToMobile(user);
-        res.status(200).json({
+        return res.status(200).json({
           message: "Verify your email Id first now and Mobile No. now"
         });
       }
     }
   } else {
-    res.status(400).json({ message: "No User Found" });
+    return res.status(400).json({ message: "No User Found" });
   }
 };
 
 module.exports.forgetPassword = async (req, res) => {
-
-  let { email, token } = req.params;
-  let { password, confirmPassword } = req.body;
-  let user = await User.findOne({ email: email });
+  let { emailormobile } = req.params;
+  let { newPassword, confirmPassword } = req.body;
+  let phoneRegex = /^([0|\+[0-9]{1,5})?([6-9][0-9]{9})$/;
+  if (phoneRegex.test(emailormobile))
+    emailormobile = "+91" + emailormobile;
+  let user = await User.findOne({ $or: [{ email: emailormobile }, { contact: emailormobile }] });
   if (user) {
-    if (user.resetPwd.token != token)
-      return res.json({ success: false, message: "You don't have access!" });
-    else if (user.resetPwd.expiresIn < Date.now()) {
-      forgetPasswordEmail(user.email);
-      return res.json({
-        success: false,
-        message: "Time Expired! New Email is sent!"
+    if (
+      !user.isEmailVerified &&
+      !user.isContactVerified &&
+      user.otpExpiresIn >= Date.now() &&
+      user.verifyEmail.expiresIn >= Date.now()
+    )
+      res.status(400).json({ message: "Get yourself verified!" });
+    else if (
+      !user.isEmailVerified &&
+      !user.isContactVerified &&
+      user.otpExpiresIn < Date.now() &&
+      user.verifyEmail.expiresIn < Date.now()
+    ) {
+      await sendVerificationLink(user.email);
+      await sendOtpToMobile(user);
+      res.status(400).json({
+        message: "Verify your email Id & Contact No now."
       });
-    } else {
-      if (
-        !user.isEmailVerified &&
-        !user.isContactVerified &&
-        user.otpExpiresIn >= Date.now() &&
-        user.verifyEmail.expiresIn >= Date.now()
-      )
-        res.status(400).json({ message: "Get yourself verified!" });
-      else if (
-        !user.isEmailVerified &&
-        !user.isContactVerified &&
-        user.otpExpiresIn < Date.now() &&
-        user.verifyEmail.expiresIn < Date.now()
-      ) {
+    } else if (!user.isEmailVerified) {
+      if (user.verifyEmail.expiresIn >= Date.now())
+        res.status(400).json({
+          message: "Verify your email Id first."
+        });
+      else {
         await sendVerificationLink(user.email);
+        res.status(400).json({
+          message: "Verify your email Id first now."
+        });
+      }
+    } else if (!user.isContactVerified) {
+      if (user.otpExpiresIn >= Date.now())
+        res.status(400).json({
+          message: "Verify your Mobile No. first."
+        });
+      else {
         await sendOtpToMobile(user);
         res.status(400).json({
-          message: "Verify your email Id & Contact No now."
+          message: "Verify your Mobile No. first now."
         });
-      } else if (!user.isEmailVerified) {
-        if (user.verifyEmail.expiresIn >= Date.now())
-          res.status(400).json({
-            message: "Verify your email Id first."
+      }
+    } else {
+      if (newPassword === confirmPassword) {
+        if (await bcrypt.compare(newPassword, user.password))
+          return res.status(400).json({
+            message:
+              "Password stored with us and your entered passwords are same!"
           });
-        else {
-          await sendVerificationLink(user.email);
-          res.status(400).json({
-            message: "Verify your email Id first now."
-          });
-        }
-      } else if (!user.isContactVerified) {
-        if (user.otpExpiresIn >= Date.now())
-          res.status(200).json({
-            message: "Verify your Mobile No. first."
-          });
-        else {
-          await sendOtpToMobile(user);
-          res.status(200).json({
-            message: "Verify your Mobile No. first now."
-          });
-        }
-      } else {
-        if (password === confirmPassword) {
-          if (await bcrypt.compare(password, user.password))
-            return res.status(400).json({
-              message:
-                "Password stored with us and your entered passwords are same!"
-            });
-          const salt = await bcrypt.genSalt(10);
-          password = await bcrypt.hash(password, salt);
-          await User.updateOne(
-            { _id: user.id },
-            {
-              $set: {
-                password: password,
-                resetPwd: { token: undefined, expiresIn: undefined }
-              }
+        const salt = await bcrypt.genSalt(10);
+        newPassword = await bcrypt.hash(newPassword, salt);
+        await User.updateOne(
+          { _id: user.id },
+          {
+            $set: {
+              password: newPassword,
+              resetPwd: { token: undefined, expiresIn: undefined }
             }
-          );
-          return res
-            .status(200)
-            .json({ message: "Password Reset Successfully!" });
-        } else {
-          return res
-            .status(400)
-            .json({ message: "Password and Confirm Password doesn't Match!" });
-        }
+          }
+        );
+        return res
+          .status(200)
+          .json({ message: "Password Reset Successfully!" });
+      } else {
+        return res
+          .status(400)
+          .json({ message: "Password and Confirm Password doesn't Match!" });
       }
     }
   } else {
@@ -1093,10 +1222,9 @@ module.exports.forgetPassword = async (req, res) => {
 };
 
 module.exports.deleteUser = async (req, res) => {
-
   let user = await User.findById(req.params.id);
   if (user) {
-    await mailToDeletedUsers(req.params.email);
+    await mailToDeletedUsers(user.email);
     await User.deleteOne({ _id: req.params.id });
     res.status(200).json({ message: "Deleted Successfully!" });
   } else {
